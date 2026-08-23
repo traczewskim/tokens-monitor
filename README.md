@@ -139,9 +139,9 @@ gitignored.
 
 ## Contributing
 
-Enable the pre-commit guard after cloning — it blocks transcripts, session
-state, real home paths, and screenshots rendered from real data, and runs a
-security review over the staged diff:
+Enable the git hooks after cloning. They block transcripts, session state,
+real home paths, and screenshots rendered from real data; on push they also
+run a security review over the commits being published:
 
 ```bash
 git config core.hooksPath .githooks

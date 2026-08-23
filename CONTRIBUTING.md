@@ -123,35 +123,50 @@ trailing background before committing.
 
 Never commit a screenshot taken against `~/.claude/projects`.
 
-## Pre-commit guard
+## Git hooks
 
 This repo is public and the tool reads private transcripts, so a careless
-commit can publish real project paths or usage data. Enable the guard once
+commit can publish real project paths or usage data. Enable the hooks once
 after cloning:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-`.githooks/pre-commit` then runs on every commit:
+Both hooks share the leak checks in `.githooks/lib/guard.sh`:
 
-1. **File policy** — refuses staged `*.jsonl` transcripts, `.claude/` session
-   state, and root-level `*.json` (a `--json` dataset dump).
-2. **Identity scan** — refuses added lines containing a real home path.
-   Your username is read at runtime with `id -un`; it is never written into
-   the hook, which is itself public.
-3. **Screenshot verification** — OCRs any staged `docs/screenshot*.png` and
-   refuses it unless the synthetic project names are visible. `.gitignore`
-   does not apply to already-tracked files, and the regeneration commands
-   above write straight back to those paths, so this checks the pixels rather
-   than trusting the filename. Requires `tesseract`.
-4. **`/security-review`** — sends the staged diff to `claude -p` and blocks on
-   any HIGH or MEDIUM finding. Skipped automatically if the `claude` CLI is
-   not installed, so external contributors are not blocked.
+1. **File policy** — refuses `*.jsonl` transcripts, `.claude/` session state,
+   and root-level `*.json` (a `--json` dataset dump).
+2. **Identity scan** — refuses added lines containing a real home path. Your
+   username is read at runtime with `id -un`; it is never written into the
+   hooks, which are themselves public.
+3. **Screenshot verification** — OCRs any `docs/screenshot*.png` and refuses
+   it unless the synthetic project names are visible. `.gitignore` does not
+   apply to already-tracked files, and the regeneration commands above write
+   straight back to those paths, so this checks the pixels rather than
+   trusting the filename. Requires `tesseract`.
 
-Escape hatches: `SKIP_AI_REVIEW=1 git commit ...` skips only step 4;
-`git commit --no-verify` skips the hook entirely.
+### `pre-commit` — fast
 
-Note that step 4 reviews the **staged** diff. The `/security-review` skill
-normally diffs `origin/HEAD..HEAD`, which at pre-commit time would review the
-previous commit rather than the one being made.
+Runs checks 1-3 against the staged changes. Takes about 0.03s.
+
+### `pre-push` — thorough
+
+Runs checks 1-3 again over the **whole range being pushed**, then sends that
+range to `claude -p` for a `/security-review` pass and blocks on any HIGH or
+MEDIUM finding.
+
+Re-running the leak checks here is deliberate: `git commit --no-verify`
+bypasses `pre-commit` entirely, and push is the point where anything actually
+becomes public. The review runs once per push rather than once per commit,
+which keeps committing instant.
+
+The review stage is skipped automatically when the `claude` CLI is absent, so
+external contributors are never blocked by it.
+
+Escape hatches: `SKIP_AI_REVIEW=1 git push ...` keeps the leak checks but
+skips the review; `--no-verify` skips a hook entirely.
+
+Note the review examines the range being pushed. The `/security-review` skill
+normally diffs `origin/HEAD..HEAD`, which would miss work that has not been
+committed or would review the wrong range at hook time.
