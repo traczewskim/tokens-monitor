@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local dataset dumps.
+# `ccusage.py --json` writes the parsed dataset, which contains real project
+# paths, session ids and usage figures from the machine it ran on.
+# Never commit one.
+/*.json
+usage-*.json
+ccusage-*.json
+dump*.json
+export/
+data/
+
+# Screenshots and captures.
+# A real screenshot of the panel shows real project directory names and usage
+# figures. Scrub or synthesize any image before committing it.
+screenshot*.png
+screenshot*.jpg
+screenshot*.jpeg
+capture*/
+
+# Claude Code transcripts. These contain full conversation text.
+# They live in ~/.claude/projects and must never end up in this repo,
+# including any copy made for testing.
+*.jsonl
+.env
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
