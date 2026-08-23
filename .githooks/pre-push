@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+#
+# tokens-monitor pre-push guard.
+#
+# Push is the point where things actually become public, so this is where the
+# /security-review pass runs. It also re-runs the deterministic leak checks
+# over the whole range being published, which closes the gap left by
+# `git commit --no-verify`.
+#
+# Enable with:
+#     git config core.hooksPath .githooks
+#
+# Escape hatches:
+#   SKIP_AI_REVIEW=1 git push ...   skip the review, keep the leak checks
+#   git push --no-verify            skip the hook entirely
+#
+# stdin: <local-ref> <local-sha> <remote-ref> <remote-sha> per ref.
+#
+set -uo pipefail
+. "$(dirname "$0")/lib/guard.sh"
+
+ZERO="0000000000000000000000000000000000000000"
+range_files=""
+range_diff=""
+tip=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  [ "$local_sha" = "$ZERO" ] && continue          # branch deletion
+
+  if [ "$remote_sha" = "$ZERO" ]; then
+    # New remote branch: review commits not already on any other remote ref.
+    base=$(git rev-list --max-count=1 "$local_sha" --not --remotes 2>/dev/null | tail -1)
+    if [ -n "$base" ]; then
+      base=$(git rev-parse "$base^" 2>/dev/null || echo "")
+    fi
+    [ -z "$base" ] && base=$(git hash-object -t tree /dev/null)
+  else
+    base="$remote_sha"
+  fi
+
+  tip="$local_sha"
+  range_files+=$'\n'$(git diff --name-only --diff-filter=ACMR "$base" "$local_sha" 2>/dev/null)
+  range_diff+=$'\n'$(git diff --diff-filter=ACMR "$base" "$local_sha" \
+                     -- . ':(exclude)*.png' ':(exclude)*.jpg' 2>/dev/null)
+done
+
+range_files=$(printf '%s\n' "$range_files" | grep -v '^$' | sort -u)
+[ -z "$range_files" ] && exit 0
+
+# -- Deterministic checks over everything being published --------------------
+guard_run "$range_files" "$range_diff" "$tip:"
+
+if [ "$guard_fail" -ne 0 ]; then
+  say ""
+  say "${DIM}Push aborted. Fix the above, or bypass with --no-verify.${OFF}"
+  exit 1
+fi
+
+# -- /security-review over the range -----------------------------------------
+if [ "${SKIP_AI_REVIEW:-0}" = "1" ]; then
+  warn "security review skipped (SKIP_AI_REVIEW=1)"
+  exit 0
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  warn "claude CLI not found — skipping the security review stage."
+  exit 0
+fi
+[ -z "$(printf '%s' "$range_diff" | tr -d '[:space:]')" ] && exit 0
+
+say "${DIM}Running /security-review on the commits being pushed (ctrl-c to skip)...${OFF}"
+
+prompt=$(cat <<PROMPT
+Run the /security-review workflow against the diff below, which is the set of
+commits about to be pushed.
+
+Follow the security-review skill's rules: report only HIGH and MEDIUM severity,
+high-confidence, concretely exploitable vulnerabilities INTRODUCED by this diff.
+Apply its exclusions - no DoS, no rate limiting, no resource exhaustion, no
+findings in documentation files, no lack-of-hardening findings, no theoretical
+issues. Do not report anything you are less than 80% confident is exploitable.
+
+Context: tokens-monitor is a zero-dependency local dashboard that parses Claude
+Code JSONL transcripts and serves a panel bound to 127.0.0.1. It validates the
+Host header against DNS rebinding and escapes transcript-derived strings before
+innerHTML. This is a PUBLIC repository, so leaking real paths, usernames or
+transcript content into committed files is itself a HIGH severity finding.
+
+Reply with findings in the skill's markdown format, then a final line that is
+exactly one of:
+VERDICT: PASS
+VERDICT: FAIL
+
+Use FAIL only if at least one HIGH or MEDIUM finding survives the skill's own
+false-positive filtering.
+
+--- DIFF BEING PUSHED ---
+$(printf '%s' "$range_diff" | head -c 180000)
+PROMPT
+)
+
+out=$(printf '%s' "$prompt" | timeout 300 claude -p 2>/dev/null)
+rc=$?
+
+if [ $rc -ne 0 ] || [ -z "$out" ]; then
+  warn "security review did not complete (exit $rc) — not blocking the push."
+  exit 0
+fi
+
+if printf '%s' "$out" | grep -q '^VERDICT: FAIL'; then
+  say ""
+  say "$out"
+  say ""
+  bad "/security-review reported findings in the commits being pushed."
+  say "${DIM}Fix them, or bypass with: SKIP_AI_REVIEW=1 git push ...${OFF}"
+  exit 1
+fi
+
+ok "/security-review passed"
+exit 0
