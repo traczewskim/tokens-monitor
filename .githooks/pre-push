@@ -20,37 +20,41 @@ set -uo pipefail
 . "$(dirname "$0")/lib/guard.sh"
 
 ZERO="0000000000000000000000000000000000000000"
-range_files=""
-range_diff=""
-tip=""
+all_diff=""
+checked=0
 
+# Each ref is checked against its OWN tip, so screenshots resolve correctly
+# when several refs are pushed at once.
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -z "${local_sha:-}" ] && continue
   [ "$local_sha" = "$ZERO" ] && continue          # branch deletion
 
   if [ "$remote_sha" = "$ZERO" ]; then
-    # New remote branch: review commits not already on any other remote ref.
-    base=$(git rev-list --max-count=1 "$local_sha" --not --remotes 2>/dev/null | tail -1)
-    if [ -n "$base" ]; then
-      base=$(git rev-parse "$base^" 2>/dev/null || echo "")
+    # New remote branch: base on the parent of the OLDEST unpublished commit,
+    # so every commit on the branch is scanned, not just the tip.
+    oldest=$(git rev-list "$local_sha" --not --remotes 2>/dev/null | tail -1)
+    if [ -n "$oldest" ]; then
+      base=$(git rev-parse "${oldest}^" 2>/dev/null || git hash-object -t tree /dev/null)
+    else
+      base=$(git hash-object -t tree /dev/null)
     fi
-    [ -z "$base" ] && base=$(git hash-object -t tree /dev/null)
   else
     base="$remote_sha"
   fi
 
-  tip="$local_sha"
-  range_files+=$'\n'$(git diff --name-only --diff-filter=ACMR "$base" "$local_sha" 2>/dev/null)
-  range_diff+=$'\n'$(git diff --diff-filter=ACMR "$base" "$local_sha" \
-                     -- . ':(exclude)*.png' ':(exclude)*.jpg' 2>/dev/null)
+  files=$(git diff --name-only --diff-filter=ACMR "$base" "$local_sha" 2>/dev/null)
+  diff=$(git diff --diff-filter=ACMR "$base" "$local_sha" \
+           -- . ':(exclude)*.png' ':(exclude)*.jpg' 2>/dev/null)
+  [ -z "$files" ] && continue
+
+  checked=$((checked + 1))
+  guard_run "$files" "$diff" "$local_sha:"
+  all_diff+=$'\n'"$diff"
 done
 
-range_files=$(printf '%s\n' "$range_files" | grep -v '^$' | sort -u)
-[ -z "$range_files" ] && exit 0
+[ "$checked" -eq 0 ] && exit 0
 
 # -- Deterministic checks over everything being published --------------------
-guard_run "$range_files" "$range_diff" "$tip:"
-
 if [ "$guard_fail" -ne 0 ]; then
   say ""
   say "${DIM}Push aborted. Fix the above, or bypass with --no-verify.${OFF}"
@@ -66,7 +70,7 @@ if ! command -v claude >/dev/null 2>&1; then
   warn "claude CLI not found — skipping the security review stage."
   exit 0
 fi
-[ -z "$(printf '%s' "$range_diff" | tr -d '[:space:]')" ] && exit 0
+[ -z "$(printf '%s' "$all_diff" | tr -d '[:space:]')" ] && exit 0
 
 say "${DIM}Running /security-review on the commits being pushed (ctrl-c to skip)...${OFF}"
 
@@ -95,7 +99,7 @@ Use FAIL only if at least one HIGH or MEDIUM finding survives the skill's own
 false-positive filtering.
 
 --- DIFF BEING PUSHED ---
-$(printf '%s' "$range_diff" | head -c 180000)
+$(printf '%s' "$all_diff" | head -c 180000)
 PROMPT
 )
 

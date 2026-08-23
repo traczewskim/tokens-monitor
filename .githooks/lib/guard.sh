@@ -69,7 +69,7 @@ guard_run() {
   # .gitignore does not apply to tracked files, and the documented
   # regeneration commands write straight back to these paths, so verify the
   # pixels rather than trusting the filename.
-  local shots tmp shot txt markers
+  local shots tmp shot txt markers verified=0
   shots=$(printf '%s\n' "$files" | grep -E '^docs/screenshot.*\.png$' || true)
   if [ -n "$shots" ]; then
     if ! command -v tesseract >/dev/null 2>&1; then
@@ -80,7 +80,13 @@ guard_run() {
       tmp=$(mktemp -d)
       while IFS= read -r shot; do
         [ -z "$shot" ] && continue
-        git show "${blobref}${shot}" > "$tmp/s.png" 2>/dev/null || continue
+        # Fail closed: an image we cannot resolve is an image we cannot verify.
+        if ! git show "${blobref}${shot}" > "$tmp/s.png" 2>/dev/null; then
+          bad "$shot could not be resolved at '${blobref}' — cannot verify its
+        contents, refusing rather than assuming it is safe."
+          continue
+        fi
+        verified=$((verified + 1))
         tesseract "$tmp/s.png" "$tmp/out" --psm 6 >/dev/null 2>&1
         txt=$(cat "$tmp/out.txt" 2>/dev/null || echo "")
 
@@ -97,7 +103,10 @@ guard_run() {
         fi
       done <<< "$shots"
       rm -rf "$tmp"
-      [ "$guard_fail" -eq 0 ] && ok "screenshots verified as synthetic"
+      # Only claim success for images actually OCR'd.
+      if [ "$guard_fail" -eq 0 ] && [ "$verified" -gt 0 ]; then
+        ok "screenshots verified as synthetic ($verified checked)"
+      fi
     fi
   fi
 
