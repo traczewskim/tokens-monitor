@@ -94,3 +94,31 @@ that reproduces the multi-line-per-response pattern described in
 `output_tokens` value that grows line over line — and confirm `--json`
 reports exactly one row for that response, with `input_tokens`/cache tokens
 taken once and `output_tokens` equal to the max across the group.
+
+## Regenerating the screenshots
+
+The images in `docs/` are rendered from synthetic data, never from real
+transcripts. To refresh them:
+
+```bash
+python3 tools/make_demo_data.py --out /tmp/demo-projects
+python3 ccusage.py --root /tmp/demo-projects --port 8790 &
+
+# light
+google-chrome --headless=new --disable-gpu --hide-scrollbars \
+  --blink-settings=preferredColorScheme=1 --virtual-time-budget=10000 \
+  --window-size=1400,2300 --screenshot=docs/screenshot.png \
+  http://127.0.0.1:8790/
+
+# dark (headless defaults to dark, so pass no colour-scheme flag)
+google-chrome --headless=new --disable-gpu --hide-scrollbars \
+  --user-data-dir=/tmp/cp-dark --virtual-time-budget=10000 \
+  --window-size=1400,2300 --screenshot=docs/screenshot-dark.png \
+  http://127.0.0.1:8790/
+```
+
+Use a separate `--user-data-dir` per run; Chrome will otherwise reuse the
+first run's rendering and silently give you two identical images. Trim the
+trailing background before committing.
+
+Never commit a screenshot taken against `~/.claude/projects`.

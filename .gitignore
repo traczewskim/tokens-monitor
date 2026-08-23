@@ -17,18 +17,24 @@ export/
 data/
 
 # Screenshots and captures.
-# A real screenshot of the panel shows real project directory names and usage
-# figures. Scrub or synthesize any image before committing it.
+# A screenshot taken against real transcripts shows real project directory
+# names and usage figures. Only commit images rendered from synthetic data
+# (see tools/make_demo_data.py); docs/ holds those and is allowed through.
 screenshot*.png
 screenshot*.jpg
 screenshot*.jpeg
 capture*/
+!docs/screenshot.png
+!docs/screenshot-dark.png
 
 # Claude Code transcripts. These contain full conversation text.
 # They live in ~/.claude/projects and must never end up in this repo,
 # including any copy made for testing.
 *.jsonl
 .env
+
+# Local agent/session state. Never publish this.
+.claude/
 
 # Editor / OS
 .DS_Store

@@ -8,9 +8,16 @@ token and cost totals, and serves an interactive panel on `localhost`.
 Python standard library only. No dependencies to install, no network calls,
 nothing leaves the machine.
 
-> **Screenshot:** not committed. A real capture of the panel shows actual
-> project directory names and usage figures, so add one only after scrubbing
-> it (or generate it from a synthetic transcript set).
+![The tokens-monitor panel](docs/screenshot.png)
+
+<details>
+<summary>Dark theme</summary>
+
+![The tokens-monitor panel in dark theme](docs/screenshot-dark.png)
+
+</details>
+
+*Rendered from synthetic data — see [Demo data](#demo-data).*
 
 ## Requirements
 
@@ -114,6 +121,21 @@ your own reference. Anthropic's actual API pricing can change; edit
 - The JSON payload served to the browser is the same data described above,
   reshaped into compact arrays for the front end — see
   `docs/ARCHITECTURE.md`.
+
+## Demo data
+
+`tools/make_demo_data.py` writes a synthetic transcript tree with invented
+project names, so you can try the panel, produce screenshots, or exercise the
+parser without touching real transcripts. Output is deterministic for a given
+`--seed`, and it reproduces the multi-line-per-response shape described above.
+
+```bash
+python3 tools/make_demo_data.py --out /tmp/demo-projects
+python3 ccusage.py --root /tmp/demo-projects
+```
+
+The screenshots above were produced this way. Generated `.jsonl` files are
+gitignored.
 
 ## Configuration
 
