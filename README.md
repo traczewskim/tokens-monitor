@@ -137,6 +137,18 @@ python3 ccusage.py --root /tmp/demo-projects
 The screenshots above were produced this way. Generated `.jsonl` files are
 gitignored.
 
+## Contributing
+
+Enable the pre-commit guard after cloning — it blocks transcripts, session
+state, real home paths, and screenshots rendered from real data, and runs a
+security review over the staged diff:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Configuration
 
 - **Pricing** — edit the `PRICING` dict at the top of `ccusage.py`. Keys are

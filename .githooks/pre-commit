@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+#
+# tokens-monitor pre-commit guard.
+#
+# This repo is public and the tool it ships reads private Claude Code
+# transcripts, so a careless commit can publish real project paths, usage
+# figures, or conversation data. This hook blocks that.
+#
+# Enable it with:
+#     git config core.hooksPath .githooks
+#
+# Stages:
+#   1-3  fast deterministic checks (always run, always block)
+#   4    /security-review via `claude -p` on the staged diff
+#
+# Escape hatches:
+#   SKIP_AI_REVIEW=1 git commit ...   skip stage 4 only
+#   git commit --no-verify            skip the whole hook (use sparingly)
+#
+set -uo pipefail
+
+RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+fail=0
+say()  { printf '%s\n' "$*" >&2; }
+bad()  { say "${RED}BLOCKED${OFF} $*"; fail=1; }
+warn() { say "${YEL}warn${OFF}    $*"; }
+ok()   { say "${GRN}ok${OFF}      $*"; }
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+# ---------------------------------------------------------------------------
+# 1. File-type policy: things that must never be tracked here.
+# ---------------------------------------------------------------------------
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  case "$f" in
+    *.jsonl)
+      bad "$f — Claude Code transcripts contain full conversation text." ;;
+    .claude/*)
+      bad "$f — local agent/session state." ;;
+    *.json)
+      case "$f" in
+        */*) : ;;  # nested json may be legitimate project config
+        *) bad "$f — looks like a \`--json\` dataset dump (real paths + session ids)." ;;
+      esac ;;
+  esac
+done <<< "$staged"
+
+# ---------------------------------------------------------------------------
+# 2. Local identity must not appear in staged text.
+#    Derived at runtime — never hardcode a username in a public repo.
+# ---------------------------------------------------------------------------
+me=$(id -un 2>/dev/null || echo "")
+text_diff=$(git diff --cached --diff-filter=ACMR -- . ':(exclude)*.png' ':(exclude)*.jpg' 2>/dev/null)
+
+if [ -n "$text_diff" ]; then
+  # Only added lines matter.
+  added=$(printf '%s\n' "$text_diff" | grep '^+' | grep -v '^+++')
+
+  # $HOME and /home/<me>, but allow the synthetic /home/dev used by the demo
+  # generator and the docs.
+  if [ -n "$me" ] && [ "$me" != "dev" ]; then
+    if printf '%s\n' "$added" | grep -qE "(/home/|/Users/)$me\b"; then
+      bad "staged text contains your home path (/home/$me or /Users/$me)."
+    fi
+    if printf '%s\n' "$added" | grep -qE "\b$me\b" ; then
+      # A bare username is noisy; report it but do not block on it alone
+      # unless it appears with a path separator (handled above).
+      warn "staged text mentions your username ('$me') — confirm it is intentional."
+    fi
+  fi
+
+  # Absolute home-ish paths for ANY user other than the synthetic one.
+  if printf '%s\n' "$added" \
+      | grep -oE "(/home/|/Users/)[A-Za-z0-9._-]+" \
+      | grep -vE "(/home/dev)$" | grep -q .; then
+    offenders=$(printf '%s\n' "$added" | grep -oE "(/home/|/Users/)[A-Za-z0-9._-]+" \
+      | grep -vE "(/home/dev)$" | sort -u | tr '\n' ' ')
+    bad "staged text contains real home paths: $offenders"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Screenshots must be rendered from synthetic data.
+#    Regeneration writes back to tracked paths, and .gitignore does not apply
+#    to tracked files — so verify the pixels, not the filename.
+# ---------------------------------------------------------------------------
+shots=$(printf '%s\n' "$staged" | grep -E '^docs/screenshot.*\.png$' || true)
+if [ -n "$shots" ]; then
+  if ! command -v tesseract >/dev/null 2>&1; then
+    bad "staged $(printf '%s' "$shots" | tr '\n' ' ')but tesseract is not installed,
+        so the image contents cannot be verified. Install tesseract-ocr, or use
+        --no-verify only if you rendered it from tools/make_demo_data.py."
+  else
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    while IFS= read -r shot; do
+      [ -z "$shot" ] && continue
+      git show ":$shot" > "$tmp/s.png" 2>/dev/null || continue
+      tesseract "$tmp/s.png" "$tmp/out" --psm 6 >/dev/null 2>&1
+      txt=$(cat "$tmp/out.txt" 2>/dev/null || echo "")
+
+      # Must look like the synthetic project set.
+      markers=$(printf '%s' "$txt" | grep -oiE "acme|data-pipeline|mobile-app" | wc -l)
+      if [ "$markers" -lt 3 ]; then
+        bad "$shot does not look like it was rendered from synthetic data
+        (found $markers synthetic project markers, expected 3+).
+        Regenerate with: python3 tools/make_demo_data.py --out /tmp/demo-projects
+                         python3 ccusage.py --root /tmp/demo-projects --port 8790"
+      fi
+      # Must not contain the local identity.
+      if [ -n "$me" ] && [ "$me" != "dev" ] && printf '%s' "$txt" | grep -qiE "\b$me\b|/home/$me"; then
+        bad "$shot appears to show your real home path or username."
+      fi
+    done <<< "$shots"
+    [ "$fail" -eq 0 ] && ok "screenshots verified as synthetic"
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  say ""
+  say "${DIM}Commit aborted. Fix the above, or bypass with --no-verify if you are certain.${OFF}"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 4. /security-review over the staged diff.
+#
+#    The skill normally diffs origin/HEAD..HEAD, which at pre-commit time
+#    would review the PREVIOUS commit rather than what is being committed.
+#    So the staged diff is passed in explicitly.
+# ---------------------------------------------------------------------------
+if [ "${SKIP_AI_REVIEW:-0}" = "1" ]; then
+  warn "security review skipped (SKIP_AI_REVIEW=1)"
+  exit 0
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  warn "claude CLI not found — skipping the security review stage."
+  exit 0
+fi
+if [ -z "$text_diff" ]; then
+  exit 0
+fi
+
+say "${DIM}Running /security-review on the staged diff (ctrl-c to skip)...${OFF}"
+
+prompt=$(cat <<PROMPT
+Run the /security-review workflow against the STAGED diff below.
+
+Follow the security-review skill's rules: report only HIGH and MEDIUM severity,
+high-confidence, concretely exploitable vulnerabilities INTRODUCED by this diff.
+Apply its exclusions - no DoS, no rate limiting, no resource exhaustion, no
+findings in documentation files, no lack-of-hardening findings, no theoretical
+issues. Do not report anything you are less than 80% confident is exploitable.
+
+Context: tokens-monitor is a zero-dependency local dashboard that parses Claude
+Code JSONL transcripts and serves a panel bound to 127.0.0.1. It validates the
+Host header against DNS rebinding and escapes transcript-derived strings before
+innerHTML. This is a PUBLIC repository, so leaking real paths, usernames or
+transcript content into committed files is itself a HIGH severity finding.
+
+Reply with findings in the skill's markdown format, then a final line that is
+exactly one of:
+VERDICT: PASS
+VERDICT: FAIL
+
+Use FAIL only if at least one HIGH or MEDIUM finding survives the skill's own
+false-positive filtering.
+
+--- STAGED DIFF ---
+$(printf '%s' "$text_diff" | head -c 180000)
+PROMPT
+)
+
+out=$(printf '%s' "$prompt" | timeout 300 claude -p 2>/dev/null)
+rc=$?
+
+if [ $rc -ne 0 ] || [ -z "$out" ]; then
+  warn "security review did not complete (exit $rc) — not blocking the commit."
+  exit 0
+fi
+
+if printf '%s' "$out" | grep -q '^VERDICT: FAIL'; then
+  say ""
+  say "$out"
+  say ""
+  bad "/security-review reported findings in the staged diff."
+  say "${DIM}Fix them, or bypass with: SKIP_AI_REVIEW=1 git commit ...${OFF}"
+  exit 1
+fi
+
+ok "/security-review passed"
+exit 0

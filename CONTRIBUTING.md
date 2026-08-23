@@ -122,3 +122,36 @@ first run's rendering and silently give you two identical images. Trim the
 trailing background before committing.
 
 Never commit a screenshot taken against `~/.claude/projects`.
+
+## Pre-commit guard
+
+This repo is public and the tool reads private transcripts, so a careless
+commit can publish real project paths or usage data. Enable the guard once
+after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-commit` then runs on every commit:
+
+1. **File policy** — refuses staged `*.jsonl` transcripts, `.claude/` session
+   state, and root-level `*.json` (a `--json` dataset dump).
+2. **Identity scan** — refuses added lines containing a real home path.
+   Your username is read at runtime with `id -un`; it is never written into
+   the hook, which is itself public.
+3. **Screenshot verification** — OCRs any staged `docs/screenshot*.png` and
+   refuses it unless the synthetic project names are visible. `.gitignore`
+   does not apply to already-tracked files, and the regeneration commands
+   above write straight back to those paths, so this checks the pixels rather
+   than trusting the filename. Requires `tesseract`.
+4. **`/security-review`** — sends the staged diff to `claude -p` and blocks on
+   any HIGH or MEDIUM finding. Skipped automatically if the `claude` CLI is
+   not installed, so external contributors are not blocked.
+
+Escape hatches: `SKIP_AI_REVIEW=1 git commit ...` skips only step 4;
+`git commit --no-verify` skips the hook entirely.
+
+Note that step 4 reviews the **staged** diff. The `/security-review` skill
+normally diffs `origin/HEAD..HEAD`, which at pre-commit time would review the
+previous commit rather than the one being made.
