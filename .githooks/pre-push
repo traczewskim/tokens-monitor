@@ -23,43 +23,54 @@ ZERO="0000000000000000000000000000000000000000"
 all_diff=""
 checked=0
 
-# Each ref is checked against its OWN tip, so screenshots resolve correctly
-# when several refs are pushed at once.
+# Every commit is inspected on its OWN tree.
+#
+# Scanning only the net range diff would miss a file that is added in one
+# commit and deleted in a later one: it vanishes from `git diff base..tip`
+# but its blob is still published in history. So iterate commit by commit.
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -z "${local_sha:-}" ] && continue
   [ "$local_sha" = "$ZERO" ] && continue          # branch deletion
 
-  if [ "$remote_sha" = "$ZERO" ]; then
-    # New remote branch: base on the parent of the OLDEST unpublished commit,
-    # so every commit on the branch is scanned, not just the tip.
-    oldest=$(git rev-list "$local_sha" --not --remotes 2>/dev/null | tail -1)
-    if [ -n "$oldest" ]; then
-      base=$(git rev-parse "${oldest}^" 2>/dev/null || git hash-object -t tree /dev/null)
-    else
-      base=$(git hash-object -t tree /dev/null)
-    fi
+  # Resolve the range. git reports the remote's sha from its ls-remote, and
+  # that object is not necessarily present locally (force-push after the
+  # remote advanced, a second remote, a shallow clone). Falling through on a
+  # failed rev-list would silently check nothing, so verify it first.
+  if [ "$remote_sha" != "$ZERO" ] && git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+    commits=$(git rev-list --reverse "${remote_sha}..${local_sha}" 2>/dev/null)
+    rc=$?
   else
-    base="$remote_sha"
+    # New branch, or a base we cannot resolve: check everything on this ref
+    # that no remote already has.
+    commits=$(git rev-list --reverse "$local_sha" --not --remotes 2>/dev/null)
+    rc=$?
   fi
 
-  files=$(git diff --name-only --diff-filter=ACMR "$base" "$local_sha" 2>/dev/null)
-  diff=$(git diff --diff-filter=ACMR "$base" "$local_sha" \
-           -- . ':(exclude)*.png' ':(exclude)*.jpg' 2>/dev/null)
-  [ -z "$files" ] && continue
+  if [ $rc -ne 0 ]; then
+    bad "could not determine which commits $local_ref would publish.
+        Refusing rather than pushing unchecked content."
+    continue
+  fi
+  [ -z "$commits" ] && continue
 
-  checked=$((checked + 1))
-  guard_run "$files" "$diff" "$local_sha:"
-  all_diff+=$'\n'"$diff"
+  for sha in $commits; do
+    files=$(git show --pretty=format: --name-only --diff-filter=ACMR -m --first-parent "$sha" 2>/dev/null \
+            | grep -v '^$' | sort -u)
+    [ -z "$files" ] && continue
+    diff=$(git show --pretty=format: --diff-filter=ACMR -m --first-parent "$sha" \
+             -- . ':(exclude)*.png' ':(exclude)*.jpg' 2>/dev/null)
+    checked=$((checked + 1))
+    guard_run "$files" "$diff" "$sha:"
+    all_diff+=$'\n'"$diff"
+  done
 done
 
-[ "$checked" -eq 0 ] && exit 0
-
-# -- Deterministic checks over everything being published --------------------
 if [ "$guard_fail" -ne 0 ]; then
   say ""
   say "${DIM}Push aborted. Fix the above, or bypass with --no-verify.${OFF}"
   exit 1
 fi
+[ "$checked" -eq 0 ] && exit 0
 
 # -- /security-review over the range -----------------------------------------
 if [ "${SKIP_AI_REVIEW:-0}" = "1" ]; then
@@ -103,11 +114,19 @@ $(printf '%s' "$all_diff" | head -c 180000)
 PROMPT
 )
 
-out=$(printf '%s' "$prompt" | timeout 300 claude -p 2>/dev/null)
+out=$(printf '%s' "$prompt" | timeout "${AI_REVIEW_TIMEOUT:-600}" claude -p 2>/dev/null)
 rc=$?
 
 if [ $rc -ne 0 ] || [ -z "$out" ]; then
-  warn "security review did not complete (exit $rc) — not blocking the push."
+  say ""
+  if [ $rc -eq 124 ]; then
+    warn "security review TIMED OUT after ${AI_REVIEW_TIMEOUT:-600}s."
+  else
+    warn "security review did not complete (exit $rc)."
+  fi
+  warn "THIS PUSH WAS NOT REVIEWED. The leak checks above did pass."
+  warn "Re-run manually, or raise AI_REVIEW_TIMEOUT."
+  say ""
   exit 0
 fi
 
