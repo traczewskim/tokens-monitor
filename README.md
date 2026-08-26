@@ -45,17 +45,25 @@ Claude Code stores them. No configuration is required for the common case.
   an unchanged scan re-renders nothing, and a poll that fails leaves the last
   good numbers on screen instead of blanking the page. The choice is
   remembered across reloads.
-- **Current session** — the rolling five-hour window Claude Code meters usage
-  in, reconstructed from transcript timestamps: tokens, cost and requests
-  used so far, and a countdown to the reset. The window opens with the first
-  request after an idle stretch, so the card shows *Last session* and the
-  time it closed once one lapses. It covers every project and ignores the
-  filters.
+- **Last 5 hours** — everything Claude Code sent from this machine in the
+  trailing five hours: tokens, cost, requests, and a gauge against your own
+  heaviest five hours on record. It covers every project and ignores the
+  filters. The totals roll forward with the clock, so they stay right between
+  refreshes.
 
-  Nothing in the transcripts records a plan allowance, so this is **not** the
-  usage meter behind `/usage` in Claude Code — it cannot know how much of
-  your limit is left. The gauge is scaled against your own heaviest
-  five-hour window on record.
+- **Plan window** — the same row shows when your plan's five-hour window
+  resets, but only when something actually knows: Claude Code records the
+  real reset instant on a request the API rate-limited, and otherwise you can
+  paste the time `/usage` shows you (stored in your browser, no network
+  calls). Once it passes, the row says so rather than guessing the next one.
+
+  The panel deliberately does not reconstruct that window from transcripts.
+  The limit is metered per **account**, across every surface — claude.ai, the
+  desktop and phone apps, another machine, a container — and a window opened
+  by any of them is invisible here. A window reconstructed from local
+  timestamps only coincides with the real one; on a machine where Claude is
+  also used elsewhere it can be hours out. `/usage` in Claude Code remains
+  the authority on how much of your limit is left.
 
 ## CLI reference
 

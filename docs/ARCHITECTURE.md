@@ -141,39 +141,46 @@ The final payload:
 display rate provenance if needed. `scan_ms` is added by the server (see
 below), not by `build()`.
 
-### The current session window
+### Recent activity and the plan window
 
-Claude Code meters plan usage in a rolling five-hour window, and the
-transcripts carry enough to reconstruct it: `session_blocks()` sorts every
-request by timestamp and walks it once, opening a window on the *hour* of the
-request that starts it. A request opens the next window when it lands after
-the current one ends, or after an idle gap of at least the window length —
-the same two conditions Claude Code itself uses to decide a session has
-lapsed.
-
-`current_session()` returns the newest window plus the heaviest one on record:
+Claude's plan limit is metered in a five-hour window that belongs to the
+**account**, not to this machine: it opens with the first request from any
+surface — Claude Code here, claude.ai, the phone app, another checkout, a
+container — and only the first of those writes transcripts under `--root`.
+Reconstructing the window from local timestamps produces a boundary that
+merely coincides with the real one; when Claude is used anywhere else it can
+be hours out. So `build()` does not try. It emits a `recent` object instead:
 
 ```json
-"session": {
-  "window_hours": 5,
-  "start": "2026-08-25T21:00:00-04:00",
-  "end":   "2026-08-26T02:00:00-04:00",
-  "last":  "2026-08-25T22:12:41-04:00",
-  "active": true,
-  "requests": 33,
-  "in": 131, "cw": 38370, "cr": 2091981, "out": 50504,
-  "cost": 2.525532,
-  "models": ["claude-opus-5", "claude-haiku-4-5"],
-  "windows": 46,
-  "peak": { "tokens": 4652854, "cost": 3.89, "start": "2026-08-24T13:00:00-04:00" }
+"recent": {
+  "hours": 5,
+  "bucket_s": 60,
+  "t0": "2026-08-25T11:00:00-04:00",
+  "buckets": [[672, 131, 38370, 2091981, 50504, 2.5255, 33], "..."],
+  "peak": { "tokens": 577434973, "cost": 421.9, "start": "2026-08-15T20:01:19-04:00" },
+  "limit_reset": "2026-08-19T02:30:00-04:00"
 }
 ```
 
-The windows are reconstructed from timestamps alone. **Nothing in the
-transcripts records a plan allowance**, so the panel can say how much you
-used in the window and when it resets, but not how much of a limit is left —
-which is why the gauge is scaled against `peak`, your own heaviest window,
-rather than against a quota. `session` is `null` when no requests were found.
+- **`buckets`** are per-minute sums — `[index, in, cw, cr, out, cost, requests]`,
+  sparse, indexed from `t0` — covering the last `RECENT_SPAN_H` hours. The
+  browser sums the ones newer than `now - hours` itself. A total computed on
+  the server would freeze at the moment of the scan, because the freshness
+  cache keeps serving the same bytes until a transcript changes; buckets let
+  the panel roll the window forward on every tick with no rescan.
+- **`peak`** is the heaviest `hours` of wall-clock anywhere in the record,
+  found by `peak_window()` with two pointers over the timestamp-sorted
+  requests — the true maximum over every window position, not the best of a
+  fixed grid. It is what the panel's gauge is scaled against, since no plan
+  allowance is available to scale against instead.
+- **`limit_reset`** is authoritative when present. Claude Code writes a
+  `quotaLimits` object onto a record whose request the API actually refused,
+  carrying `rateLimitType` and a `resetsAt` epoch; `five_hour_reset()` picks
+  the newest five-hour one out of the transcripts during the scan. That fires
+  a handful of times in a long history, and the panel uses it only while it is
+  still in the future — otherwise the reset time comes from the user, who can
+  paste what `/usage` showed them.
+
 ## 5. HTTP endpoints
 
 Every request is refused with `403` unless its `Host` header names a
@@ -237,13 +244,23 @@ from `filtered()`:
   as the color-intensity metric.
 - **Heaviest sessions** — rows grouped by session, top 12 by cost.
 
-The **current session** card sits above the KPI tiles and renders the
-`session` object described in section 4: tokens, cost and requests for the
-live five-hour window, a gauge against `peak`, and a countdown to the reset.
-It is deliberately exempt from the filters — the window is a property of the
-machine, not of the project you happen to be looking at. Its countdown is
-clock-driven and re-renders every 10 seconds whether or not the heartbeat is
-armed.
+The **last 5 hours** card sits above the KPI tiles and renders the `recent`
+object described in section 4: `recentTotals()` sums the buckets newer than
+`now - hours` on every render, so the trailing window moves with the clock
+rather than with the data. It is deliberately exempt from the filters — usage
+against the plan is a property of the account, not of the project you happen
+to be looking at.
+
+Its second row reports the plan window's reset, and takes that instant only
+from a source that knows it: `resetAnchor()` prefers `limit_reset` while that
+is still in the future, falls back to a time the user pasted from `/usage`
+(kept in `localStorage` under `ccusage-reset`, never sent anywhere), and
+otherwise says it does not know. When the anchor passes, the row says the
+window ended and offers a re-sync instead of extrapolating the next boundary —
+after an idle stretch the next window opens whenever the account is next used,
+which this machine cannot observe. The card re-renders every 10 seconds
+whether or not the heartbeat is armed, and skips that tick while the reset
+field is open so it cannot yank the input mid-edit.
 
 ### The heartbeat
 

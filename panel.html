@@ -119,8 +119,14 @@ button:hover, select:hover { background: var(--surface-2); }
 .card-head { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
 .card-head .spacer { flex: 1; }
 
-#session .num { font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
-#session .num b { color: var(--text-primary); font-weight: 640; font-size: 15px; }
+#recent .num { font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+#recent .num b { color: var(--text-primary); font-weight: 640; font-size: 15px; }
+.link { background: none; border: 0; padding: 0 0 0 7px; color: var(--series-1); font-size: 12.5px; }
+.link:hover { background: none; text-decoration: underline; }
+.mrow input[type="time"] {
+  font: inherit; font-size: 12.5px; padding: 3px 6px; border-radius: 6px;
+  border: 1px solid var(--border-strong); background: var(--surface-1); color: var(--text-primary);
+}
 .mrow { display: grid; grid-template-columns: 116px minmax(90px, 1fr) auto; gap: 14px; align-items: center; margin-bottom: 9px; }
 .mrow .lab { color: var(--text-secondary); font-size: 12.5px; }
 .mrow .val { color: var(--text-muted); font-size: 12.5px; font-variant-numeric: tabular-nums; text-align: right; }
@@ -210,7 +216,7 @@ tbody tr:hover { background: var(--surface-2); }
     </select>
   </div>
 
-  <div class="card hidden" id="session"></div>
+  <div class="card hidden" id="recent"></div>
 
   <div class="kpis" id="kpis"></div>
 
@@ -689,7 +695,15 @@ function renderSessions(rows) {
     </tr></thead><tbody>${body}</tbody></table>`;
 }
 
-/* ---------- current 5h session window ---------- */
+/* ---------- last 5 hours ---------- */
+/* The plan's five-hour window belongs to the account, not to this machine: it
+   can be opened by claude.ai, a phone or another checkout, none of which write
+   transcripts here. So the card reports a trailing five hours — exact, local,
+   never drifting — and takes the reset instant only from a source that knows
+   it: a rate-limited response, or the number the user reads off /usage. */
+const RESET_KEY = "ccusage-reset";
+let resetEditing = false;
+
 function fmtLeft(ms) {
   const m = Math.max(0, Math.round(ms / 60000));
   if (m < 60) return m + " min";
@@ -699,57 +713,141 @@ function clockOf(ms) {
   return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function renderSession() {
-  const box = document.getElementById("session");
-  const s = S.data && S.data.session;
-  if (!s) { box.classList.add("hidden"); return; }
+function loadReset() {
+  try {
+    const v = JSON.parse(localStorage.getItem(RESET_KEY) || "null");
+    return v && v.at ? v : null;
+  } catch (_) { return null; }
+}
+function storeReset(at) {
+  try { localStorage.setItem(RESET_KEY, JSON.stringify({ at, synced: Date.now() })); } catch (_) {}
+}
+function forgetReset() {
+  try { localStorage.removeItem(RESET_KEY); } catch (_) {}
+}
+
+/* Whichever source actually knows the boundary wins; nothing is inferred. */
+function resetAnchor(rec, now) {
+  const auth = rec.limit_reset ? Date.parse(rec.limit_reset) : 0;
+  if (auth > now) return { at: auth, note: "from a rate-limited request" };
+  const u = loadReset();
+  if (u) return { at: u.at, note: "synced from /usage at " + clockOf(u.synced), user: true };
+  return null;
+}
+
+function recentTotals(rec, now) {
+  const t0 = Date.parse(rec.t0);
+  const cut = (now - rec.hours * 3600000 - t0) / (rec.bucket_s * 1000);
+  // A bucket dated after now is a clock artifact, not traffic in the window.
+  const top = (now - t0) / (rec.bucket_s * 1000);
+  const t = { in: 0, cw: 0, cr: 0, out: 0, cost: 0, n: 0 };
+  for (const b of rec.buckets) {
+    if (b[0] < cut || b[0] > top) continue;
+    t.in += b[1]; t.cw += b[2]; t.cr += b[3]; t.out += b[4]; t.cost += b[5]; t.n += b[6];
+  }
+  return t;
+}
+
+function renderRecent() {
+  const box = document.getElementById("recent");
+  const rec = S.data && S.data.recent;
+  if (!rec) { box.classList.add("hidden"); return; }
+  if (resetEditing) return;                       // never yank the field mid-edit
   box.classList.remove("hidden");
 
   const now = Date.now();
-  const start = Date.parse(s.start), end = Date.parse(s.end);
-  const live = now < end;
-  const tokens = s.in + s.cw + s.cr + s.out;
-  const peak = (s.peak && s.peak.tokens) || 0;
-  // No plan allowance is recorded in the transcripts, so the gauge is scaled
-  // against the heaviest window this machine has on record instead.
+  const t = recentTotals(rec, now);
+  const tokens = t.in + t.cw + t.cr + t.out;
+  const peak = (rec.peak && rec.peak.tokens) || 0;
   const share = peak > 0 ? Math.min(1, tokens / peak) : 0;
-  const elapsed = Math.min(1, Math.max(0, (now - start) / (end - start)));
+
+  const a = resetAnchor(rec, now);
+  const live = a && a.at > now;
+  const elapsed = live ? Math.min(1, Math.max(0, 1 - (a.at - now) / (rec.hours * 3600000))) : (a ? 1 : 0);
+  let windowVal;
+  if (live) {
+    windowVal = `Resets in ${fmtLeft(a.at - now)} · ${esc(clockOf(a.at))}`
+      + `<span class="val"> · ${esc(a.note)}</span>`
+      + (a.user ? ` <button class="link" id="resetedit">edit</button>` : "");
+  } else if (a) {
+    windowVal = `Ended ${esc(clockOf(a.at))} — a new one has opened since`
+      + ` <button class="link" id="resetedit">re-sync</button>`;
+  } else {
+    windowVal = `Unknown — this machine cannot see it`
+      + ` <button class="link" id="resetedit">sync from /usage</button>`;
+  }
 
   box.innerHTML = `<div class="card-head">
       <div>
-        <h2>${live ? "Current session" : "Last session"}</h2>
-        <div class="desc">The rolling ${s.window_hours}-hour window Claude Code meters usage in, opened ${esc(clockOf(start))}. Every project, ignoring the filters above.</div>
+        <h2>Last ${rec.hours} hours</h2>
+        <div class="desc">Everything Claude Code sent from this machine in the trailing ${rec.hours} hours — every project, ignoring the filters above.</div>
       </div>
       <span class="spacer"></span>
-      <div class="num"><b>${fmtT(tokens)}</b> tokens · ${fmtC(s.cost)} · ${fmtN(s.requests)} requests</div>
+      <div class="num"><b>${fmtT(tokens)}</b> tokens · ${fmtC(t.cost)} · ${fmtN(t.n)} requests</div>
     </div>
     <div class="mrow">
-      <span class="lab">Used in window</span>
-      <span class="meter" id="sessmeter"><i style="width:${(share * 100).toFixed(1)}%"></i></span>
-      <span class="val">${peak ? fmtPct(share * 100) + " of your heaviest window (" + fmtT(peak) + ")" : "—"}</span>
+      <span class="lab">Used</span>
+      <span class="meter" id="recmeter"><i style="width:${(share * 100).toFixed(1)}%"></i></span>
+      <span class="val">${peak ? fmtPct(share * 100) + " of your heaviest " + rec.hours + "h (" + fmtT(peak) + ")" : "—"}</span>
     </div>
     <div class="mrow">
-      <span class="lab">${live ? "Elapsed" : "Window"}</span>
+      <span class="lab">Plan window</span>
       <span class="meter"><i class="${live ? "soft" : "spent"}" style="width:${(elapsed * 100).toFixed(1)}%"></i></span>
-      <span class="val">${live
-        ? "Resets in " + fmtLeft(end - now) + " · " + esc(clockOf(end))
-        : "Closed " + relAge(now - end) + " — the next request opens a new one"}</span>
+      <span class="val">${windowVal}</span>
     </div>`;
 
-  bindTip(document.getElementById("sessmeter"), `<div class="t">This ${s.window_hours}h window</div>
-    <div class="r"><span>Input</span><b>${fmtT(s.in)}</b></div>
-    <div class="r"><span>Cache write</span><b>${fmtT(s.cw)}</b></div>
-    <div class="r"><span>Cache read</span><b>${fmtT(s.cr)}</b></div>
-    <div class="r"><span>Output</span><b>${fmtT(s.out)}</b></div>
-    <div class="r" style="margin-top:5px;border-top:1px solid var(--border);padding-top:5px"><span>Cost</span><b>${fmtC(s.cost)}</b></div>
-    <div class="r"><span>Models</span><b>${esc(s.models.map(shortModel).join(", ")) || "—"}</b></div>
-    <div class="r"><span>Last request</span><b>${esc(clockOf(Date.parse(s.last)))}</b></div>`);
+  bindTip(document.getElementById("recmeter"), `<div class="t">Last ${rec.hours} hours</div>
+    <div class="r"><span>Input</span><b>${fmtT(t.in)}</b></div>
+    <div class="r"><span>Cache write</span><b>${fmtT(t.cw)}</b></div>
+    <div class="r"><span>Cache read</span><b>${fmtT(t.cr)}</b></div>
+    <div class="r"><span>Output</span><b>${fmtT(t.out)}</b></div>
+    <div class="r" style="margin-top:5px;border-top:1px solid var(--border);padding-top:5px"><span>Cost</span><b>${fmtC(t.cost)}</b></div>
+    <div class="r"><span>Requests</span><b>${fmtN(t.n)}</b></div>`);
+
+  const edit = document.getElementById("resetedit");
+  if (edit) edit.addEventListener("click", openResetEditor);
+}
+
+function openResetEditor() {
+  const now = Date.now();
+  const a = resetAnchor(S.data.recent, now);
+  const cell = document.querySelector("#recent .mrow:last-child .val");
+  resetEditing = true;
+  cell.innerHTML = `<input type="time" id="resetin" value="${a ? esc(hhmm(a.at)) : ""}">
+    <button id="resetsave">Save</button>
+    <button class="link" id="resetcancel">cancel</button>
+    ${a && a.user ? '<button class="link" id="resetforget">clear</button>' : ""}`;
+  const input = document.getElementById("resetin");
+  input.focus();
+  input.addEventListener("keydown", e => { if (e.key === "Enter") saveResetFromInput(); });
+  document.getElementById("resetsave").addEventListener("click", saveResetFromInput);
+  document.getElementById("resetcancel").addEventListener("click", () => { resetEditing = false; renderRecent(); });
+  const f = document.getElementById("resetforget");
+  if (f) f.addEventListener("click", () => { forgetReset(); resetEditing = false; renderRecent(); });
+}
+
+function hhmm(ms) {
+  const d = new Date(ms);
+  return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+
+/* "23:00" read off /usage means the next 23:00, not one that already passed. */
+function saveResetFromInput() {
+  const v = (document.getElementById("resetin").value || "").trim();
+  const m = v.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) { resetEditing = false; renderRecent(); return; }
+  const d = new Date();
+  d.setHours(+m[1], +m[2], 0, 0);
+  if (d.getTime() < Date.now() - 60000) d.setDate(d.getDate() + 1);
+  storeReset(d.getTime());
+  resetEditing = false;
+  renderRecent();
 }
 
 /* ---------- orchestration ---------- */
 function renderAll() {
   hideTip();
-  renderSession();
+  renderRecent();
   const rows = filtered();
   renderKpis(rows);
   renderDaily(rows);
@@ -851,7 +949,9 @@ function setBeat(secs) {
   renderBeat();
 }
 
-setInterval(() => { if (!document.hidden && S.data) renderSession(); }, 10000);
+// The trailing window and the countdown both move with the clock, not with
+// the data, so the card re-renders on its own whether or not a beat is armed.
+setInterval(() => { if (!document.hidden && S.data) renderRecent(); }, 10000);
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden || !beatSecs) return;

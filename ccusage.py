@@ -47,11 +47,17 @@ CACHE_WRITE_5M = 1.25   # x input rate
 CACHE_WRITE_1H = 2.00   # x input rate
 CACHE_READ     = 0.10   # x input rate
 
-# Claude Code meters plan usage in a rolling window that opens with the first
-# request after an idle stretch and runs for five hours. Reconstructed here
-# from timestamps only — the transcripts carry no plan-limit figures, so this
-# says how much *you* used in the window, not how much of an allowance is left.
-SESSION_WINDOW_H = 5
+# Claude's plan limit is metered in a five-hour window, but that window belongs
+# to the *account*: it opens with the first request from any surface — this
+# machine, claude.ai, a phone, a container — and the transcripts here only see
+# Claude Code on this machine. Reconstructing the window from local timestamps
+# therefore produces a boundary that merely coincides with the real one, so the
+# panel reports a plain trailing five hours instead and takes the reset instant
+# from an authoritative source or from the user (see `quota_reset` below).
+WINDOW_H = 5
+BUCKET_S = 60        # resolution of the recent-activity buckets
+RECENT_SPAN_H = 12   # how much recent history to bucket, so the panel can roll
+                     # the window forward without the server rescanning
 
 
 def normalize_model(model):
@@ -85,6 +91,25 @@ def iter_transcripts(root=ROOT):
                 yield os.path.join(dirpath, name)
 
 
+def five_hour_reset(line):
+    """Epoch seconds of a five-hour limit reset carried on a rate-limited record.
+
+    Claude Code writes `quotaLimits` only when the API actually refuses a
+    request, so this fires a handful of times in a long history — but when it
+    does, it is the real window boundary rather than a guess.
+    """
+    try:
+        q = (json.loads(line) or {}).get("quotaLimits") or {}
+    except ValueError:
+        return 0
+    if q.get("rateLimitType") != "five_hour":
+        return 0
+    try:
+        return int(q.get("resetsAt") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def scan(root=ROOT):
     """Parse every transcript into one deduplicated record per API request.
 
@@ -96,6 +121,7 @@ def scan(root=ROOT):
     """
     requests = {}
     files = 0
+    quota_reset = None   # newest five-hour reset the API actually told us about
     for path in iter_transcripts(root):
         files += 1
         try:
@@ -104,6 +130,8 @@ def scan(root=ROOT):
             continue
         with fh:
             for lineno, line in enumerate(fh):
+                if '"quotaLimits"' in line:
+                    quota_reset = max(quota_reset or 0, five_hour_reset(line))
                 if '"usage"' not in line:
                     continue
                 try:
@@ -160,72 +188,83 @@ def scan(root=ROOT):
                     "think": ((usage.get("output_tokens_details") or {})
                               .get("thinking_tokens") or 0),
                 }
-    return requests, files
+    if quota_reset:
+        quota_reset = datetime.fromtimestamp(quota_reset).astimezone().isoformat(
+            timespec="seconds")
+    return requests, files, quota_reset or None
 
 
-def session_blocks(records):
-    """Group requests into the rolling 5-hour windows Claude Code meters against.
+def peak_window(records, hours=WINDOW_H):
+    """Heaviest `hours` of wall-clock anywhere in the record.
 
-    A window opens on the hour of the request that starts it and runs for
-    SESSION_WINDOW_H hours; a request that lands after the window closes — or
-    after an idle gap at least as long as the window — opens the next one.
+    Two pointers over the timestamp-sorted records, so it is the true maximum
+    over every possible window position, not the best of a fixed grid.
     """
-    span = timedelta(hours=SESSION_WINDOW_H)
-    blocks = []
-    for r in sorted(records, key=lambda r: r["dt"]):
-        dt = r["dt"]
-        b = blocks[-1] if blocks else None
-        if b is None or dt >= b["end"] or dt - b["last"] >= span:
-            start = dt.replace(minute=0, second=0, microsecond=0)
-            b = {"start": start, "end": start + span, "last": dt, "requests": 0,
-                 "in": 0, "cw": 0, "cr": 0, "out": 0, "cost": 0.0, "models": {}}
-            blocks.append(b)
-        b["last"] = dt
-        b["requests"] += 1
-        b["in"] += r["in"]
-        b["cw"] += r["cw5"] + r["cw1"]
-        b["cr"] += r["cr"]
-        b["out"] += r["out"]
-        b["cost"] += r["cost"]
-        b["models"][r["model"]] = b["models"].get(r["model"], 0) + 1
-    return blocks
+    items = sorted(
+        ((r["dt"], r["in"] + r["cw5"] + r["cw1"] + r["cr"] + r["out"], r["cost"])
+         for r in records),
+        key=lambda x: x[0],
+    )
+    span = timedelta(hours=hours)
+    best = {"tokens": 0, "cost": 0.0, "start": None}
+    lo, tok, cost = 0, 0, 0.0
+    for t, k, c in items:
+        tok += k
+        cost += c
+        while t - items[lo][0] >= span:
+            tok -= items[lo][1]
+            cost -= items[lo][2]
+            lo += 1
+        if tok > best["tokens"]:
+            best = {"tokens": tok, "cost": round(cost, 6),
+                    "start": items[lo][0].isoformat(timespec="seconds")}
+    return best
 
 
-def block_tokens(b):
-    return b["in"] + b["cw"] + b["cr"] + b["out"]
+def recent_buckets(records, now):
+    """Bucket the last RECENT_SPAN_H hours so the browser can roll its own window.
+
+    The freshness cache serves the same bytes until a transcript changes, so a
+    total computed here would freeze while the clock kept moving. Sending
+    per-minute buckets instead lets the panel re-sum the trailing five hours on
+    every tick without the server touching the disk again.
+    """
+    t0 = (now - timedelta(hours=RECENT_SPAN_H)).replace(second=0, microsecond=0)
+    acc = {}
+    for r in records:
+        if r["dt"] < t0:
+            continue
+        i = int((r["dt"] - t0).total_seconds() // BUCKET_S)
+        a = acc.setdefault(i, [0, 0, 0, 0, 0.0, 0])
+        a[0] += r["in"]
+        a[1] += r["cw5"] + r["cw1"]
+        a[2] += r["cr"]
+        a[3] += r["out"]
+        a[4] += r["cost"]
+        a[5] += 1
+    rows = [[i, a[0], a[1], a[2], a[3], round(a[4], 6), a[5]]
+            for i, a in sorted(acc.items())]
+    return t0, rows
 
 
-def current_session(records):
-    """The newest 5-hour window, plus the busiest one on record to scale it against."""
-    blocks = session_blocks(records)
-    if not blocks:
-        return None
-    cur = blocks[-1]
-    peak = max(blocks, key=block_tokens)
+def recent_payload(records, quota_reset, now=None):
+    now = now or datetime.now().astimezone()
+    t0, buckets = recent_buckets(records, now)
     return {
-        "window_hours": SESSION_WINDOW_H,
-        "start": cur["start"].isoformat(timespec="seconds"),
-        "end": cur["end"].isoformat(timespec="seconds"),
-        "last": cur["last"].isoformat(timespec="seconds"),
-        "active": datetime.now().astimezone() < cur["end"],
-        "requests": cur["requests"],
-        "in": cur["in"],
-        "cw": cur["cw"],
-        "cr": cur["cr"],
-        "out": cur["out"],
-        "cost": round(cur["cost"], 6),
-        "models": [m for m, _ in sorted(cur["models"].items(), key=lambda kv: -kv[1])],
-        "windows": len(blocks),
-        "peak": {
-            "tokens": block_tokens(peak),
-            "cost": round(peak["cost"], 6),
-            "start": peak["start"].isoformat(timespec="seconds"),
-        },
+        "hours": WINDOW_H,
+        "bucket_s": BUCKET_S,
+        "t0": t0.isoformat(timespec="seconds"),
+        "buckets": buckets,
+        "peak": peak_window(records),
+        # Authoritative when present: Claude Code records the real reset instant
+        # on a request the server actually rate-limited. Rare, and only useful
+        # while it is still in the future, but it beats any reconstruction.
+        "limit_reset": quota_reset,
     }
 
 
 def build(root=ROOT):
-    requests, files = scan(root)
+    requests, files, quota_reset = scan(root)
 
     models, projects, sessions, days = {}, {}, {}, {}
 
@@ -282,7 +321,7 @@ def build(root=ROOT):
         "projects": keys_in_order(projects),
         "sessions": keys_in_order(sessions),
         "rows": rows,
-        "session": current_session(requests.values()),
+        "recent": recent_payload(requests.values(), quota_reset),
         "unpriced": unpriced,
         "pricing": {m: {k: v for k, v in p.items()} for m, p in PRICING.items()},
     }
@@ -319,15 +358,23 @@ def summary(data):
                % (human(tot[0]), human(tot[1]), human(tot[2]), human(tot[3])))
     out.append("  total %s tokens | API-rate equivalent $%.2f" % (human(total), cost))
     out.append("")
-    ses = data.get("session")
-    if ses:
-        left = (datetime.fromisoformat(ses["end"]) - datetime.now().astimezone())
-        mins = int(left.total_seconds() // 60)
-        when = ("resets in %dh %02dm" % (mins // 60, mins % 60)) if ses["active"] else "closed"
-        out.append("  current %dh window (%s): %s tokens | $%.2f | %d requests — %s"
-                   % (ses["window_hours"], ses["start"][11:16],
-                      human(ses["in"] + ses["cw"] + ses["cr"] + ses["out"]),
-                      ses["cost"], ses["requests"], when))
+    rec = data.get("recent")
+    if rec:
+        now = datetime.now().astimezone()
+        t0 = datetime.fromisoformat(rec["t0"])
+        cut = (now - timedelta(hours=rec["hours"]) - t0).total_seconds() / rec["bucket_s"]
+        tok = cost = n = 0
+        for b in rec["buckets"]:
+            if b[0] >= cut:
+                tok += b[1] + b[2] + b[3] + b[4]; cost += b[5]; n += b[6]
+        out.append("  last %dh: %s tokens | $%.2f | %d requests"
+                   % (rec["hours"], human(tok), cost, n))
+        if rec.get("limit_reset"):
+            reset = datetime.fromisoformat(rec["limit_reset"])
+            if reset > now:
+                mins = int((reset - now).total_seconds() // 60)
+                out.append("  plan window resets %s (in %dh %02dm), per a rate-limited request"
+                           % (reset.strftime("%H:%M"), mins // 60, mins % 60))
         out.append("")
     out.append("  %-24s %10s %12s" % ("model", "tokens", "cost"))
     for m, (t, c) in sorted(per_model.items(), key=lambda kv: -kv[1][1]):
