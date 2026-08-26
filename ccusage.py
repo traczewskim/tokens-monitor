@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.expanduser("~/.claude/projects")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +46,12 @@ PRICING = {
 CACHE_WRITE_5M = 1.25   # x input rate
 CACHE_WRITE_1H = 2.00   # x input rate
 CACHE_READ     = 0.10   # x input rate
+
+# Claude Code meters plan usage in a rolling window that opens with the first
+# request after an idle stretch and runs for five hours. Reconstructed here
+# from timestamps only — the transcripts carry no plan-limit figures, so this
+# says how much *you* used in the window, not how much of an allowance is left.
+SESSION_WINDOW_H = 5
 
 
 def normalize_model(model):
@@ -157,6 +163,67 @@ def scan(root=ROOT):
     return requests, files
 
 
+def session_blocks(records):
+    """Group requests into the rolling 5-hour windows Claude Code meters against.
+
+    A window opens on the hour of the request that starts it and runs for
+    SESSION_WINDOW_H hours; a request that lands after the window closes — or
+    after an idle gap at least as long as the window — opens the next one.
+    """
+    span = timedelta(hours=SESSION_WINDOW_H)
+    blocks = []
+    for r in sorted(records, key=lambda r: r["dt"]):
+        dt = r["dt"]
+        b = blocks[-1] if blocks else None
+        if b is None or dt >= b["end"] or dt - b["last"] >= span:
+            start = dt.replace(minute=0, second=0, microsecond=0)
+            b = {"start": start, "end": start + span, "last": dt, "requests": 0,
+                 "in": 0, "cw": 0, "cr": 0, "out": 0, "cost": 0.0, "models": {}}
+            blocks.append(b)
+        b["last"] = dt
+        b["requests"] += 1
+        b["in"] += r["in"]
+        b["cw"] += r["cw5"] + r["cw1"]
+        b["cr"] += r["cr"]
+        b["out"] += r["out"]
+        b["cost"] += r["cost"]
+        b["models"][r["model"]] = b["models"].get(r["model"], 0) + 1
+    return blocks
+
+
+def block_tokens(b):
+    return b["in"] + b["cw"] + b["cr"] + b["out"]
+
+
+def current_session(records):
+    """The newest 5-hour window, plus the busiest one on record to scale it against."""
+    blocks = session_blocks(records)
+    if not blocks:
+        return None
+    cur = blocks[-1]
+    peak = max(blocks, key=block_tokens)
+    return {
+        "window_hours": SESSION_WINDOW_H,
+        "start": cur["start"].isoformat(timespec="seconds"),
+        "end": cur["end"].isoformat(timespec="seconds"),
+        "last": cur["last"].isoformat(timespec="seconds"),
+        "active": datetime.now().astimezone() < cur["end"],
+        "requests": cur["requests"],
+        "in": cur["in"],
+        "cw": cur["cw"],
+        "cr": cur["cr"],
+        "out": cur["out"],
+        "cost": round(cur["cost"], 6),
+        "models": [m for m, _ in sorted(cur["models"].items(), key=lambda kv: -kv[1])],
+        "windows": len(blocks),
+        "peak": {
+            "tokens": block_tokens(peak),
+            "cost": round(peak["cost"], 6),
+            "start": peak["start"].isoformat(timespec="seconds"),
+        },
+    }
+
+
 def build(root=ROOT):
     requests, files = scan(root)
 
@@ -186,6 +253,7 @@ def build(root=ROOT):
                 + r["out"] * out_r
             ) / 1_000_000.0
 
+        r["cost"] = cost
         rows.append([
             idx(days, day),
             dt.hour,
@@ -214,6 +282,7 @@ def build(root=ROOT):
         "projects": keys_in_order(projects),
         "sessions": keys_in_order(sessions),
         "rows": rows,
+        "session": current_session(requests.values()),
         "unpriced": unpriced,
         "pricing": {m: {k: v for k, v in p.items()} for m, p in PRICING.items()},
     }
@@ -250,6 +319,16 @@ def summary(data):
                % (human(tot[0]), human(tot[1]), human(tot[2]), human(tot[3])))
     out.append("  total %s tokens | API-rate equivalent $%.2f" % (human(total), cost))
     out.append("")
+    ses = data.get("session")
+    if ses:
+        left = (datetime.fromisoformat(ses["end"]) - datetime.now().astimezone())
+        mins = int(left.total_seconds() // 60)
+        when = ("resets in %dh %02dm" % (mins // 60, mins % 60)) if ses["active"] else "closed"
+        out.append("  current %dh window (%s): %s tokens | $%.2f | %d requests — %s"
+                   % (ses["window_hours"], ses["start"][11:16],
+                      human(ses["in"] + ses["cw"] + ses["cr"] + ses["out"]),
+                      ses["cost"], ses["requests"], when))
+        out.append("")
     out.append("  %-24s %10s %12s" % ("model", "tokens", "cost"))
     for m, (t, c) in sorted(per_model.items(), key=lambda kv: -kv[1][1]):
         out.append("  %-24s %10s %11.2f" % (m, human(t), c))
