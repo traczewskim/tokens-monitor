@@ -130,6 +130,7 @@ The final payload:
   "projects": ["/path/one", "..."],
   "sessions": ["...", "..."],
   "rows": [[0, 14, 3, 0, 0, 0, 0, 1200, 300, 0, 260, 40, 0.0126], "..."],
+  "session": { "...current 5-hour window, see below..." },
   "unpriced": {"<synthetic>": 3},
   "pricing": { "...copy of PRICING..." },
   "scan_ms": 0
@@ -140,6 +141,39 @@ The final payload:
 display rate provenance if needed. `scan_ms` is added by the server (see
 below), not by `build()`.
 
+### The current session window
+
+Claude Code meters plan usage in a rolling five-hour window, and the
+transcripts carry enough to reconstruct it: `session_blocks()` sorts every
+request by timestamp and walks it once, opening a window on the *hour* of the
+request that starts it. A request opens the next window when it lands after
+the current one ends, or after an idle gap of at least the window length —
+the same two conditions Claude Code itself uses to decide a session has
+lapsed.
+
+`current_session()` returns the newest window plus the heaviest one on record:
+
+```json
+"session": {
+  "window_hours": 5,
+  "start": "2026-08-25T21:00:00-04:00",
+  "end":   "2026-08-26T02:00:00-04:00",
+  "last":  "2026-08-25T22:12:41-04:00",
+  "active": true,
+  "requests": 33,
+  "in": 131, "cw": 38370, "cr": 2091981, "out": 50504,
+  "cost": 2.525532,
+  "models": ["claude-opus-5", "claude-haiku-4-5"],
+  "windows": 46,
+  "peak": { "tokens": 4652854, "cost": 3.89, "start": "2026-08-24T13:00:00-04:00" }
+}
+```
+
+The windows are reconstructed from timestamps alone. **Nothing in the
+transcripts records a plan allowance**, so the panel can say how much you
+used in the window and when it resets, but not how much of a limit is left —
+which is why the gauge is scaled against `peak`, your own heaviest window,
+rather than against a quota. `session` is `null` when no requests were found.
 ## 5. HTTP endpoints
 
 Every request is refused with `403` unless its `Host` header names a
@@ -171,15 +205,17 @@ If it differs, or `?refresh=1` was passed, or nothing has been built yet,
 `build()` runs again and `scan_ms` (wall-clock milliseconds for that rebuild)
 is attached to the payload before caching it.
 
-This means: transcripts that grow, get added, or get removed are picked up
-automatically on the next page load or the panel's **Refresh** button — no
-polling interval, no file watcher, no dependency beyond `os.stat`.
+This means: transcripts that grow, get added, or get removed are picked up on
+the next page load, the panel's **Refresh** button, or a heartbeat poll — no
+file watcher, no dependency beyond `os.stat`. It is also what makes the
+heartbeat cheap: an idle poll costs one `stat()` per transcript and re-sends
+the bytes that are already in memory.
 
 ## 6. Front end: filtering and rendering
 
-`panel.html` fetches `/api/data` exactly once per page load (or once more on
-**Refresh**, via `?refresh=1`) and keeps the full row set in memory as
-`S.data`. All filtering — time range (7/30/90 days or all), project, model,
+`panel.html` fetches `/api/data` on page load, on **Refresh** (via
+`?refresh=1`), and on each heartbeat tick if one is armed, keeping the full
+row set in memory as `S.data`. All filtering — time range (7/30/90 days or all), project, model,
 main-thread vs. subagent — happens **client-side** in `filtered()`, which
 scans `S.data.rows` and returns the subset matching the current `S` filter
 state. No filter ever triggers a new network request.
@@ -200,6 +236,32 @@ from `filtered()`:
 - **Heatmap** — rows bucketed into a 7×24 weekday-by-local-hour grid, tokens
   as the color-intensity metric.
 - **Heaviest sessions** — rows grouped by session, top 12 by cost.
+
+The **current session** card sits above the KPI tiles and renders the
+`session` object described in section 4: tokens, cost and requests for the
+live five-hour window, a gauge against `peak`, and a countdown to the reset.
+It is deliberately exempt from the filters — the window is a property of the
+machine, not of the project you happen to be looking at. Its countdown is
+clock-driven and re-renders every 10 seconds whether or not the heartbeat is
+armed.
+
+### The heartbeat
+
+The **Auto-refresh** control (`Off` / `30s` / `60s`, persisted in
+`localStorage` under `ccusage-beat`) arms an interval that re-fetches
+`/api/data` *without* `refresh=1`, so the server answers from its freshness
+cache unless a transcript actually changed. Three things keep an armed
+heartbeat from being disruptive:
+
+- **Unchanged payloads never re-render.** The response is compared as text
+  against the last one; identical bytes short-circuit before `JSON.parse`, so
+  an idle poll leaves the DOM — and any open dropdown or tooltip — untouched.
+- **Hidden tabs do not poll.** A tick while `document.hidden` sets a missed
+  flag instead of fetching; the `visibilitychange` handler catches up when
+  the tab is looked at again.
+- **A failed poll keeps the dashboard.** If the server is gone, the numbers
+  stay on screen, the status dot goes grey and reads "no answer from the
+  server — retrying"; the next successful tick clears it.
 
 All charts are built as inline SVG DOM nodes (`document.createElementNS`) —
 no charting library, no CDN, nothing that requires network access. Theme

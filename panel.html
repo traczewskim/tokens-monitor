@@ -86,6 +86,15 @@ button:hover, select:hover { background: var(--surface-2); }
 .seg button + button { border-left: 1px solid var(--border); }
 .seg button[aria-pressed="true"] { background: var(--series-1); color: #fff; }
 
+.beat { display: inline-flex; align-items: center; gap: 6px; }
+.beat .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--series-1); animation: beatpulse 2.4s ease-in-out infinite;
+}
+.beat.stale .dot { background: var(--text-muted); animation: none; }
+@keyframes beatpulse { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
+@media (prefers-reduced-motion: reduce) { .beat .dot { animation: none; } }
+
 .filters {
   display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
   margin: 18px 0 20px; padding-bottom: 18px; border-bottom: 1px solid var(--border);
@@ -109,6 +118,17 @@ button:hover, select:hover { background: var(--surface-2); }
 .card .desc { color: var(--text-muted); font-size: 12.5px; margin-bottom: 12px; }
 .card-head { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
 .card-head .spacer { flex: 1; }
+
+#session .num { font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+#session .num b { color: var(--text-primary); font-weight: 640; font-size: 15px; }
+.mrow { display: grid; grid-template-columns: 116px minmax(90px, 1fr) auto; gap: 14px; align-items: center; margin-bottom: 9px; }
+.mrow .lab { color: var(--text-secondary); font-size: 12.5px; }
+.mrow .val { color: var(--text-muted); font-size: 12.5px; font-variant-numeric: tabular-nums; text-align: right; }
+.meter { height: 7px; border-radius: 4px; background: var(--surface-2); overflow: hidden; }
+.meter i { display: block; height: 100%; border-radius: 4px; background: var(--series-1); }
+.meter i.soft { background: var(--series-3); }
+.meter i.spent { background: var(--text-muted); }
+@media (max-width: 620px) { .mrow { grid-template-columns: 1fr; gap: 4px; } .mrow .val { text-align: left; } }
 
 .legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 2px 0 10px; }
 .legend .item { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-secondary); }
@@ -154,7 +174,14 @@ tbody tr:hover { background: var(--surface-2); }
   <header>
     <h1>Claude Code Usage</h1>
     <span class="sub" id="scaninfo">loading…</span>
+    <span class="sub beat hidden" id="beatstatus"><span class="dot"></span><span id="beatage"></span></span>
     <span class="spacer"></span>
+    <span class="sub">Auto-refresh</span>
+    <div class="seg" id="beat" role="group" aria-label="Auto-refresh interval">
+      <button data-b="0" aria-pressed="true">Off</button>
+      <button data-b="30" aria-pressed="false">30s</button>
+      <button data-b="60" aria-pressed="false">60s</button>
+    </div>
     <button id="refresh">Refresh</button>
     <div class="seg" id="theme">
       <button data-t="auto" aria-pressed="true">Auto</button>
@@ -182,6 +209,8 @@ tbody tr:hover { background: var(--surface-2); }
       <option value="1">Subagents only</option>
     </select>
   </div>
+
+  <div class="card hidden" id="session"></div>
 
   <div class="kpis" id="kpis"></div>
 
@@ -660,8 +689,67 @@ function renderSessions(rows) {
     </tr></thead><tbody>${body}</tbody></table>`;
 }
 
+/* ---------- current 5h session window ---------- */
+function fmtLeft(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  if (m < 60) return m + " min";
+  return Math.floor(m / 60) + "h " + String(m % 60).padStart(2, "0") + "m";
+}
+function clockOf(ms) {
+  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function renderSession() {
+  const box = document.getElementById("session");
+  const s = S.data && S.data.session;
+  if (!s) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+
+  const now = Date.now();
+  const start = Date.parse(s.start), end = Date.parse(s.end);
+  const live = now < end;
+  const tokens = s.in + s.cw + s.cr + s.out;
+  const peak = (s.peak && s.peak.tokens) || 0;
+  // No plan allowance is recorded in the transcripts, so the gauge is scaled
+  // against the heaviest window this machine has on record instead.
+  const share = peak > 0 ? Math.min(1, tokens / peak) : 0;
+  const elapsed = Math.min(1, Math.max(0, (now - start) / (end - start)));
+
+  box.innerHTML = `<div class="card-head">
+      <div>
+        <h2>${live ? "Current session" : "Last session"}</h2>
+        <div class="desc">The rolling ${s.window_hours}-hour window Claude Code meters usage in, opened ${esc(clockOf(start))}. Every project, ignoring the filters above.</div>
+      </div>
+      <span class="spacer"></span>
+      <div class="num"><b>${fmtT(tokens)}</b> tokens · ${fmtC(s.cost)} · ${fmtN(s.requests)} requests</div>
+    </div>
+    <div class="mrow">
+      <span class="lab">Used in window</span>
+      <span class="meter" id="sessmeter"><i style="width:${(share * 100).toFixed(1)}%"></i></span>
+      <span class="val">${peak ? fmtPct(share * 100) + " of your heaviest window (" + fmtT(peak) + ")" : "—"}</span>
+    </div>
+    <div class="mrow">
+      <span class="lab">${live ? "Elapsed" : "Window"}</span>
+      <span class="meter"><i class="${live ? "soft" : "spent"}" style="width:${(elapsed * 100).toFixed(1)}%"></i></span>
+      <span class="val">${live
+        ? "Resets in " + fmtLeft(end - now) + " · " + esc(clockOf(end))
+        : "Closed " + relAge(now - end) + " — the next request opens a new one"}</span>
+    </div>`;
+
+  bindTip(document.getElementById("sessmeter"), `<div class="t">This ${s.window_hours}h window</div>
+    <div class="r"><span>Input</span><b>${fmtT(s.in)}</b></div>
+    <div class="r"><span>Cache write</span><b>${fmtT(s.cw)}</b></div>
+    <div class="r"><span>Cache read</span><b>${fmtT(s.cr)}</b></div>
+    <div class="r"><span>Output</span><b>${fmtT(s.out)}</b></div>
+    <div class="r" style="margin-top:5px;border-top:1px solid var(--border);padding-top:5px"><span>Cost</span><b>${fmtC(s.cost)}</b></div>
+    <div class="r"><span>Models</span><b>${esc(s.models.map(shortModel).join(", ")) || "—"}</b></div>
+    <div class="r"><span>Last request</span><b>${esc(clockOf(Date.parse(s.last)))}</b></div>`);
+}
+
 /* ---------- orchestration ---------- */
 function renderAll() {
+  hideTip();
+  renderSession();
   const rows = filtered();
   renderKpis(rows);
   renderDaily(rows);
@@ -683,12 +771,32 @@ function fillSelect(id, values, labelFn) {
   sel.value = keep;
 }
 
-async function load(force) {
-  document.getElementById("scaninfo").textContent = "reading transcripts…";
-  const res = await fetch("/api/data" + (force ? "?refresh=1" : ""));
-  if (!res.ok) { document.getElementById("scaninfo").textContent = "error: " + res.status; return; }
-  S.data = await res.json();
-  const d = S.data;
+/* `quiet` is the heartbeat path: no "reading…" flicker, and a failed poll leaves
+   the dashboard standing instead of replacing it with an error. */
+async function load(force, quiet) {
+  if (loading) return;
+  loading = true;
+  if (!quiet) document.getElementById("scaninfo").textContent = "reading transcripts…";
+  try {
+    const res = await fetch("/api/data" + (force ? "?refresh=1" : ""));
+    if (!res.ok) throw new Error("error: " + res.status);
+    const text = await res.text();
+    lastLoadAt = Date.now();
+    offline = false;
+    // The server returns byte-identical JSON while no transcript has changed,
+    // so an idle heartbeat costs one string compare and re-renders nothing.
+    if (text !== lastPayload) { lastPayload = text; apply(JSON.parse(text)); }
+  } catch (err) {
+    offline = true;
+    if (!(quiet && S.data)) document.getElementById("scaninfo").textContent = String(err.message || err);
+  } finally {
+    loading = false;
+    renderBeat();
+  }
+}
+
+function apply(d) {
+  S.data = d;
 
   const byCost = new Map();
   for (const r of d.rows) byCost.set(r[IDX.proj], (byCost.get(r[IDX.proj]) || 0) + r[IDX.cost]);
@@ -705,6 +813,50 @@ async function load(force) {
     + (un.length ? " Unpriced models counted as $0: " + un.join(", ") + "." : "");
   renderAll();
 }
+
+/* ---------- heartbeat ---------- */
+const BEAT_KEY = "ccusage-beat";
+const BEATS = [0, 30, 60];
+let loading = false, lastPayload = null, lastLoadAt = 0, offline = false;
+let beatSecs = 0, beatTimer = null, ageTimer = null, beatMissed = false;
+
+function relAge(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return s + "s ago";
+  const m = Math.round(s / 60);
+  return m < 60 ? m + "m ago" : Math.round(m / 60) + "h ago";
+}
+
+function renderBeat() {
+  const box = document.getElementById("beatstatus");
+  box.classList.toggle("hidden", beatSecs === 0);
+  if (!beatSecs) return;
+  box.classList.toggle("stale", offline);
+  document.getElementById("beatage").textContent =
+    offline ? "no answer from the server — retrying" : "updated " + relAge(Date.now() - lastLoadAt);
+}
+
+function setBeat(secs) {
+  beatSecs = secs;
+  clearInterval(beatTimer); clearInterval(ageTimer);
+  beatTimer = ageTimer = null;
+  if (secs > 0) {
+    // A background tab is not worth stat-ing every transcript for; the
+    // visibilitychange handler catches up the moment the tab is looked at.
+    beatTimer = setInterval(() => { if (document.hidden) beatMissed = true; else load(false, true); }, secs * 1000);
+    ageTimer = setInterval(renderBeat, 1000);
+  }
+  try { localStorage.setItem(BEAT_KEY, String(secs)); } catch (_) {}
+  renderBeat();
+}
+
+setInterval(() => { if (!document.hidden && S.data) renderSession(); }, 10000);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden || !beatSecs) return;
+  if (beatMissed || Date.now() - lastLoadAt >= beatSecs * 1000) { beatMissed = false; load(false, true); }
+});
 
 /* ---------- events ---------- */
 function segment(id, attr, fn) {
@@ -726,6 +878,7 @@ segment("theme", "data-t", v => {
 document.getElementById("fproj").addEventListener("change", e => { S.proj = e.target.value; renderAll(); });
 document.getElementById("fmodel").addEventListener("change", e => { S.model = e.target.value; renderAll(); });
 document.getElementById("fside").addEventListener("change", e => { S.side = e.target.value; renderAll(); });
+segment("beat", "data-b", v => setBeat(+v));
 document.getElementById("refresh").addEventListener("click", () => load(true));
 document.getElementById("tabletoggle").addEventListener("click", (e) => {
   S.showTable = !S.showTable;
@@ -744,6 +897,15 @@ try {
     document.documentElement.setAttribute("data-theme", saved);
     [...document.querySelectorAll("#theme button")].forEach(b =>
       b.setAttribute("aria-pressed", String(b.getAttribute("data-t") === saved)));
+  }
+} catch (_) {}
+
+try {
+  const saved = +localStorage.getItem(BEAT_KEY);
+  if (saved > 0 && BEATS.includes(saved)) {
+    [...document.querySelectorAll("#beat button")].forEach(b =>
+      b.setAttribute("aria-pressed", String(+b.getAttribute("data-b") === saved)));
+    setBeat(saved);
   }
 } catch (_) {}
 

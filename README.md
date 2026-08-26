@@ -36,6 +36,27 @@ python3 ccusage.py --open     # ...and open a browser automatically
 By default it reads transcripts from `~/.claude/projects`, which is where
 Claude Code stores them. No configuration is required for the common case.
 
+## The panel
+
+- **Auto-refresh** — `Off` / `30s` / `60s` in the header. A heartbeat poll
+  re-reads the transcripts on that interval and updates the dashboard in
+  place; a small dot shows how long ago the data was refreshed. Polling
+  pauses while the tab is in the background and resumes when you come back,
+  an unchanged scan re-renders nothing, and a poll that fails leaves the last
+  good numbers on screen instead of blanking the page. The choice is
+  remembered across reloads.
+- **Current session** — the rolling five-hour window Claude Code meters usage
+  in, reconstructed from transcript timestamps: tokens, cost and requests
+  used so far, and a countdown to the reset. The window opens with the first
+  request after an idle stretch, so the card shows *Last session* and the
+  time it closed once one lapses. It covers every project and ignores the
+  filters.
+
+  Nothing in the transcripts records a plan allowance, so this is **not** the
+  usage meter behind `/usage` in Claude Code — it cannot know how much of
+  your limit is left. The gauge is scaled against your own heaviest
+  five-hour window on record.
+
 ## CLI reference
 
 | Flag        | Default              | Description                                    |
