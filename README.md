@@ -45,6 +45,12 @@ Claude Code stores them. No configuration is required for the common case.
   an unchanged scan re-renders nothing, and a poll that fails leaves the last
   good numbers on screen instead of blanking the page. The choice is
   remembered across reloads.
+- **Range** — `1d` / `7d` / `30d` / `90d` / `All`, applied to everything
+  below the filter bar. `1d` is the odd one out: it covers the trailing 24
+  hours and buckets them by hour, so the daily chart becomes an hourly one and
+  the per-active-day averages become per-active-hour. A transcript record
+  carries an hour but no minute, so the window is 24 whole hour-slots ending
+  with the one in progress — not a rolling 24 hours to the minute.
 - **Last 5 hours** — everything Claude Code sent from this machine in the
   trailing five hours: tokens, cost, requests, and a gauge against your own
   heaviest five hours on record. It covers every project and ignores the
