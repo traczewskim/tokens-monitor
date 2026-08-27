@@ -199,6 +199,7 @@ tbody tr:hover { background: var(--surface-2); }
   <div class="filters">
     <label>Range</label>
     <div class="seg" id="range">
+      <button data-d="1">1d</button>
       <button data-d="7">7d</button>
       <button data-d="30" aria-pressed="true">30d</button>
       <button data-d="90">90d</button>
@@ -223,8 +224,8 @@ tbody tr:hover { background: var(--surface-2); }
   <div class="card">
     <div class="card-head">
       <div>
-        <h2>Daily usage</h2>
-        <div class="desc">One bar per day, split by how each token was billed.</div>
+        <h2 id="dailytitle">Daily usage</h2>
+        <div class="desc" id="dailydesc">One bar per day, split by how each token was billed.</div>
       </div>
       <span class="spacer"></span>
       <div class="seg" id="dailymode">
@@ -283,6 +284,24 @@ const SERIES = [
   { key: "out", label: "Output",      col: "var(--series-4)", i: IDX.out },
 ];
 const DOW = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+
+/* The 1d range is the one bucketed by hour. A row carries a day and an hour of
+   the day but no minute, so the finest honest window is the trailing 24 whole
+   hours, ending with the one in progress. */
+const HOURLY_SPAN = 24;
+function isHourly() { return S.range === 1; }
+function dayKey(dt) {
+  return [dt.getFullYear(), String(dt.getMonth()+1).padStart(2,"0"), String(dt.getDate()).padStart(2,"0")].join("-");
+}
+function hourKey(day, h) { return day + " " + String(h).padStart(2, "0"); }
+/* Start of the window: the current hour, rolled back a full span. */
+function hourlyStart() {
+  const t = new Date();
+  t.setMinutes(0, 0, 0);
+  t.setHours(t.getHours() - (HOURLY_SPAN - 1));
+  return t;
+}
+function slotDate(key) { return new Date(key.slice(0, 10) + "T" + key.slice(11) + ":00:00"); }
 
 /* ---------- formatting ---------- */
 function fmtT(n) {
@@ -360,18 +379,20 @@ function niceTicks(max, count) {
 function filtered() {
   const d = S.data;
   if (!d) return [];
-  let minDay = "";
-  if (S.range > 0) {
+  let minDay = "", minHour = "";
+  if (isHourly()) {
+    const t = hourlyStart();
+    minHour = hourKey(dayKey(t), t.getHours());
+  } else if (S.range > 0) {
     const t = new Date();
     t.setDate(t.getDate() - (S.range - 1));
-    minDay = t.toISOString().slice(0, 10);
-    // toISOString is UTC; rebuild from local parts instead
-    minDay = [t.getFullYear(), String(t.getMonth()+1).padStart(2,"0"), String(t.getDate()).padStart(2,"0")].join("-");
+    minDay = dayKey(t);
   }
   const pi = S.proj ? d.projects.indexOf(S.proj) : -1;
   const mi = S.model ? d.models.indexOf(S.model) : -1;
   const out = [];
   for (const r of d.rows) {
+    if (minHour && hourKey(d.days[r[IDX.day]], r[IDX.hour]) < minHour) continue;
     if (minDay && d.days[r[IDX.day]] < minDay) continue;
     if (S.proj && r[IDX.proj] !== pi) continue;
     if (S.model && r[IDX.model] !== mi) continue;
@@ -406,10 +427,14 @@ function groupBy(rows, keyFn) {
 function renderKpis(rows) {
   const t = totals(rows);
   const d = S.data;
-  const days = new Set(rows.map(r => r[IDX.day])).size;
+  // A 24-hour window rarely spans two whole days, so it averages per hour instead.
+  const hourly = isHourly();
+  const unit = hourly ? "hour" : "day";
+  const active = hourly
+    ? new Set(rows.map(r => r[IDX.day] + ":" + r[IDX.hour])).size
+    : new Set(rows.map(r => r[IDX.day])).size;
   const sess = new Set(rows.map(r => r[IDX.sess])).size;
-  const now = new Date();
-  const today = [now.getFullYear(), String(now.getMonth()+1).padStart(2,"0"), String(now.getDate()).padStart(2,"0")].join("-");
+  const today = dayKey(new Date());
   const todayRows = rows.filter(r => d.days[r[IDX.day]] === today);
   const tt = totals(todayRows);
   const cacheShare = t.tokens ? (t.cr / t.tokens * 100) : 0;
@@ -417,9 +442,9 @@ function renderKpis(rows) {
 
   const tiles = [
     { k: "Total tokens", v: fmtT(t.tokens), n: fmtN(t.tokens) + " exact" },
-    { k: "API-rate cost", v: fmtC(t.cost), n: days ? fmtC(t.cost / days) + " per active day" : "—" },
+    { k: "API-rate cost", v: fmtC(t.cost), n: active ? fmtC(t.cost / active) + " per active " + unit : "—" },
     { k: "Today", v: fmtT(tt.tokens), n: fmtC(tt.cost) + " · " + fmtN(tt.n) + " requests" },
-    { k: "Requests", v: fmtN(t.n), n: fmtN(sess) + " sessions · " + days + " active days" },
+    { k: "Requests", v: fmtN(t.n), n: fmtN(sess) + " sessions · " + active + " active " + unit + "s" },
     { k: "Served from cache", v: cacheShare.toFixed(1) + "%", n: "of all tokens read" },
     { k: "Output tokens", v: fmtT(t.out), n: fmtT(t.think) + " of it thinking" },
     { k: "Subagent share", v: t.cost ? (subCost / t.cost * 100).toFixed(0) + "%" : "0%", n: "of cost, " + fmtC(subCost) },
@@ -442,29 +467,51 @@ function renderDaily(rows) {
   const host = document.getElementById("daily");
   host.innerHTML = "";
   const d = S.data;
-  const byDay = new Map();
+  const hourly = isHourly();
+  document.getElementById("dailytitle").textContent = hourly ? "Hourly usage" : "Daily usage";
+  document.getElementById("dailydesc").textContent = hourly
+    ? "One bar per hour over the trailing 24 hours, split by how each token was billed."
+    : "One bar per day, split by how each token was billed.";
+
+  const blank = (key) => ({ key, in:0, cw:0, cr:0, out:0, cost:0, n:0 });
+  const buckets = new Map();
   for (const r of rows) {
     const day = d.days[r[IDX.day]];
-    let a = byDay.get(day);
-    if (!a) { a = { day, in:0, cw:0, cr:0, out:0, cost:0, n:0 }; byDay.set(day, a); }
+    const key = hourly ? hourKey(day, r[IDX.hour]) : day;
+    let a = buckets.get(key);
+    if (!a) { a = blank(key); buckets.set(key, a); }
     a.in += r[IDX.in]; a.cw += r[IDX.cw]; a.cr += r[IDX.cr];
     a.out += r[IDX.out]; a.cost += r[IDX.cost]; a.n++;
   }
-  // fill calendar gaps so quiet days read as quiet
-  let list = [...byDay.values()].sort((a, b) => a.day < b.day ? -1 : 1);
-  if (list.length) {
+  // fill the gaps so quiet hours (or quiet days) read as quiet
+  let list = [...buckets.values()].sort((a, b) => a.key < b.key ? -1 : 1);
+  if (hourly && buckets.size) {
+    const cur = hourlyStart();
+    list = [];
+    for (let i = 0; i < HOURLY_SPAN; i++) {
+      const key = hourKey(dayKey(cur), cur.getHours());
+      list.push(buckets.get(key) || blank(key));
+      cur.setHours(cur.getHours() + 1);
+    }
+  } else if (!hourly && list.length) {
     const full = [];
-    const cur = new Date(list[0].day + "T00:00:00");
-    const end = new Date(list[list.length - 1].day + "T00:00:00");
-    const map = byDay;
+    const cur = new Date(list[0].key + "T00:00:00");
+    const end = new Date(list[list.length - 1].key + "T00:00:00");
     while (cur <= end) {
-      const key = [cur.getFullYear(), String(cur.getMonth()+1).padStart(2,"0"), String(cur.getDate()).padStart(2,"0")].join("-");
-      full.push(map.get(key) || { day: key, in:0, cw:0, cr:0, out:0, cost:0, n:0 });
+      const key = dayKey(cur);
+      full.push(buckets.get(key) || blank(key));
       cur.setDate(cur.getDate() + 1);
     }
     if (full.length <= 190) list = full;
   }
   if (!list.length) { host.innerHTML = '<div class="empty">No usage in this range.</div>'; renderLegend(totals(rows)); return; }
+
+  for (const a of list) {
+    if (!hourly) { a.label = a.key; continue; }
+    const h = +a.key.slice(11);
+    a.label = slotDate(a.key).toLocaleDateString(undefined, { month: "short", day: "numeric" })
+      + " " + String(h).padStart(2, "0") + ":00–" + String((h + 1) % 24).padStart(2, "0") + ":00";
+  }
 
   const W = host.clientWidth || 900, H = 260;
   const M = { t: 12, r: 8, b: 30, l: 54 };
@@ -490,7 +537,7 @@ function renderDaily(rows) {
     const total = valOf(a);
     if (total <= 0) return;
     const rowsHtml = SERIES.map(s => `<div class="r"><span><span class="sw" style="background:${s.col}"></span>${s.label}</span><b>${fmtT(a[s.key])}</b></div>`).join("");
-    const html = `<div class="t">${a.day}</div>${costMode ? "" : rowsHtml}
+    const html = `<div class="t">${a.label}</div>${costMode ? "" : rowsHtml}
       <div class="r" style="margin-top:5px;border-top:1px solid var(--border);padding-top:5px"><span>Total</span><b>${fmtT(a.in+a.cw+a.cr+a.out)}</b></div>
       <div class="r"><span>Cost</span><b>${fmtC(a.cost)}</b></div>
       <div class="r"><span>Requests</span><b>${fmtN(a.n)}</b></div>`;
@@ -516,17 +563,32 @@ function renderDaily(rows) {
 
   svg.appendChild(el("line", { class: "baseline", x1: M.l, x2: M.l + iw, y1: M.t + ih, y2: M.t + ih }));
 
-  const labelEvery = Math.ceil(list.length / Math.max(3, Math.floor(iw / 78)));
+  const labelEvery = Math.ceil(list.length / Math.max(3, Math.floor(iw / (hourly ? 54 : 78))));
+  // Phase the ticks onto midnight so the day the window rolls into is always named.
+  let phase = 0;
+  if (hourly) {
+    const mid = list.findIndex(a => +a.key.slice(11) === 0);
+    if (mid > 0) phase = mid % labelEvery;
+  }
   list.forEach((a, i) => {
-    if (i % labelEvery) return;
+    if (((i - phase) % labelEvery + labelEvery) % labelEvery) return;
     const x = M.l + i * step + step / 2;
-    const dt = new Date(a.day + "T00:00:00");
-    svg.appendChild(txt(x, H - 10, dt.toLocaleDateString(undefined, { month: "short", day: "numeric" }), "axis", "middle"));
+    let label;
+    if (!hourly) {
+      label = new Date(a.key + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    } else {
+      // Midnight names the day the window has just rolled into; the rest are clock times.
+      const h = +a.key.slice(11);
+      label = h === 0
+        ? slotDate(a.key).toLocaleDateString(undefined, { month: "short", day: "numeric" })
+        : String(h).padStart(2, "0") + ":00";
+    }
+    svg.appendChild(txt(x, H - 10, label, "axis", "middle"));
   });
 
   host.appendChild(svg);
   renderLegend(totals(rows));
-  renderDailyTable(list);
+  renderDailyTable(list, hourly);
 }
 
 function renderLegend(t) {
@@ -545,15 +607,15 @@ function renderLegend(t) {
   }
 }
 
-function renderDailyTable(list) {
+function renderDailyTable(list, hourly) {
   const host = document.getElementById("dailytable");
   const rows = [...list].reverse().map(a => `<tr>
-      <td class="mono">${a.day}</td>
+      <td class="mono">${hourly ? a.key + ":00" : a.key}</td>
       <td class="num">${fmtN(a.in)}</td><td class="num">${fmtN(a.cw)}</td>
       <td class="num">${fmtN(a.cr)}</td><td class="num">${fmtN(a.out)}</td>
       <td class="num">${fmtN(a.in+a.cw+a.cr+a.out)}</td>
       <td class="num">${fmtC(a.cost)}</td><td class="num">${fmtN(a.n)}</td></tr>`).join("");
-  host.innerHTML = `<table><thead><tr><th>Day</th><th class="num">Input</th><th class="num">Cache write</th>
+  host.innerHTML = `<table><thead><tr><th>${hourly ? "Hour" : "Day"}</th><th class="num">Input</th><th class="num">Cache write</th>
     <th class="num">Cache read</th><th class="num">Output</th><th class="num">Total</th>
     <th class="num">Cost</th><th class="num">Reqs</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
